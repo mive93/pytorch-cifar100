@@ -44,13 +44,6 @@ def train(epoch):
 
         n_iter = (epoch - 1) * len(cifar100_training_loader) + batch_index + 1
 
-        last_layer = list(net.children())[-1]
-        for name, para in last_layer.named_parameters():
-            if 'weight' in name:
-                writer.add_scalar('LastLayerGradients/grad_norm2_weights', para.grad.norm(), n_iter)
-            if 'bias' in name:
-                writer.add_scalar('LastLayerGradients/grad_norm2_bias', para.grad.norm(), n_iter)
-
         print('Training Epoch: {epoch} [{trained_samples}/{total_samples}]\tLoss: {:0.4f}\tLR: {:0.6f}'.format(
             loss.item(),
             optimizer.param_groups[0]['lr'],
@@ -58,9 +51,6 @@ def train(epoch):
             trained_samples=batch_index * args.b + len(images),
             total_samples=len(cifar100_training_loader.dataset)
         ))
-
-        #update training loss for each iteration
-        writer.add_scalar('Train/loss', loss.item(), n_iter)
 
         if epoch <= args.warm:
             warmup_scheduler.step()
@@ -72,10 +62,13 @@ def train(epoch):
 
     finish = time.time()
 
+    #update training loss for each iteration
+    writer.add_scalar('Train/loss', loss.item(), epoch)
+
     print('epoch {} training time consumed: {:.2f}s'.format(epoch, finish - start))
 
 @torch.no_grad()
-def eval_training(epoch=0, tb=True):
+def eval_training(data_loader, split="Test", epoch=0, tb=True):
 
     start = time.time()
     net.eval()
@@ -83,7 +76,7 @@ def eval_training(epoch=0, tb=True):
     test_loss = 0.0 # cost function error
     correct = 0.0
 
-    for (images, labels) in cifar100_test_loader:
+    for (images, labels) in data_loader:
 
         if args.gpu:
             images = images.cuda()
@@ -101,20 +94,20 @@ def eval_training(epoch=0, tb=True):
         print('GPU INFO.....')
         print(torch.cuda.memory_summary(), end='')
     print('Evaluating Network.....')
-    print('Test set: Epoch: {}, Average loss: {:.4f}, Accuracy: {:.4f}, Time consumed:{:.2f}s'.format(
+    print(split + ' set: Epoch: {}, Average loss: {:.4f}, Accuracy: {:.4f}, Time consumed:{:.2f}s'.format(
         epoch,
-        test_loss / len(cifar100_test_loader.dataset),
-        correct.float() / len(cifar100_test_loader.dataset),
+        test_loss / len(data_loader.dataset),
+        correct.float() / len(data_loader.dataset),
         finish - start
     ))
     print()
 
     #add informations to tensorboard
     if tb:
-        writer.add_scalar('Test/Average loss', test_loss / len(cifar100_test_loader.dataset), epoch)
-        writer.add_scalar('Test/Accuracy', correct.float() / len(cifar100_test_loader.dataset), epoch)
+        writer.add_scalar(split + '/Average loss', test_loss / len(data_loader.dataset), epoch)
+        writer.add_scalar(split + '/Accuracy', correct.float() / len(data_loader.dataset), epoch)
 
-    return correct.float() / len(cifar100_test_loader.dataset)
+    return correct.float() / len(data_loader.dataset), test_loss / len(data_loader.dataset)
 
 if __name__ == '__main__':
 
@@ -130,13 +123,16 @@ if __name__ == '__main__':
     net = get_network(args)
 
     #data preprocessing:
-    cifar100_training_loader = get_training_dataloader(
+    train_ds, val_ds = get_training_dataloader(
         settings.CIFAR100_TRAIN_MEAN,
         settings.CIFAR100_TRAIN_STD,
         num_workers=4,
         batch_size=args.b,
         shuffle=True
     )
+
+    cifar100_training_loader = DataLoader(train_ds, shuffle=True, num_workers=4, batch_size=args.b)
+    cifar100_validation_loader = DataLoader(val_ds, shuffle=True, num_workers=4, batch_size=args.b)
 
     cifar100_test_loader = get_test_dataloader(
         settings.CIFAR100_TRAIN_MEAN,
@@ -148,7 +144,7 @@ if __name__ == '__main__':
 
     loss_function = nn.CrossEntropyLoss()
     optimizer = optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
-    train_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=settings.MILESTONES, gamma=0.2) #learning rate decay
+    # train_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=settings.MILESTONES, gamma=0.2) #learning rate decay
     iter_per_epoch = len(cifar100_training_loader)
     warmup_scheduler = WarmUpLR(optimizer, iter_per_epoch * args.warm)
 
@@ -188,7 +184,7 @@ if __name__ == '__main__':
             print('found best acc weights file:{}'.format(weights_path))
             print('load best training file to test acc...')
             net.load_state_dict(torch.load(weights_path))
-            best_acc = eval_training(tb=False)
+            best_acc , _ = eval_training(cifar100_test_loader, tb=False)
             print('best acc is {:0.2f}'.format(best_acc))
 
         recent_weights_file = most_recent_weights(os.path.join(settings.CHECKPOINT_PATH, args.net, recent_folder))
@@ -201,16 +197,62 @@ if __name__ == '__main__':
         resume_epoch = last_epoch(os.path.join(settings.CHECKPOINT_PATH, args.net, recent_folder))
 
 
+    patience = settings.MAX_PATIENCE
+    min_val_loss = settings.MAX_LOSS
+    cur_custom_iter = settings.MAX_CUSTOM_ITER
+
+    bs = args.b
+
     for epoch in range(1, settings.EPOCH + 1):
-        if epoch > args.warm:
-            train_scheduler.step(epoch)
+        # if epoch > args.warm:
+        #     train_scheduler.step(epoch)
 
         if args.resume:
             if epoch <= resume_epoch:
                 continue
 
         train(epoch)
-        acc = eval_training(epoch)
+
+        # test and validation
+        acc, _ = eval_training(cifar100_test_loader, 'Test', epoch)
+        val_acc, val_loss = eval_training(cifar100_validation_loader, 'Val', epoch)
+
+        # logic to move learning rate or batch size, based on the validation split
+        if val_loss > min_val_loss:
+            patience -= 1
+        else:
+            min_val_loss = val_loss
+            patience = settings.MAX_PATIENCE
+
+        if settings.CUSTOM_LOGIC: 
+            if patience == 0:
+                if not settings.LRA_DIS and settings.USING_LRA: # if learning rate annealing is in use
+                    optimizer.param_groups[0]['lr']  = optimizer.param_groups[0]['lr']*settings.LRA_DECAY
+                    if not settings.IBS_DIS:
+                        settings.USING_LRA = False
+                elif not settings.IBS_DIS:
+                    if bs == settings.MAX_BATCH_SIZE: # if maximum batch size reached, stop
+                        cur_custom_iter = 0
+                    else:  # increment the batch size
+                        bs = min(bs*settings.IBS_INCREMENT, settings.MAX_BATCH_SIZE) 
+                        cifar100_training_loader = DataLoader(train_ds, shuffle=True, num_workers=4, batch_size=bs)
+                        cifar100_validation_loader = DataLoader(val_ds, shuffle=True, num_workers=4, batch_size=bs)
+                        if not settings.LRA_DIS:
+                            settings.USING_LRA = True
+                
+                patience = settings.MAX_PATIENCE
+                cur_custom_iter -=1
+
+
+        writer.add_scalar('Val' + '/Patience', patience, epoch)
+        writer.add_scalar('Train' + '/BS', bs, epoch)
+        writer.add_scalar('Train' + '/lr', optimizer.param_groups[0]['lr'], epoch)
+
+        if settings.CUSTOM_LOGIC: 
+            if cur_custom_iter == 0:
+                torch.save(net.state_dict(), weights_path)
+                break
+
 
         #start to save best performance model after learning rate decay to 0.01
         if epoch > settings.MILESTONES[1] and best_acc < acc:
