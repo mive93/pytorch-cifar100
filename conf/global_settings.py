@@ -35,8 +35,10 @@ LOG_DIR = 'runs'
 #save weights file per SAVE_EPOCH epoch
 SAVE_EPOCH = 10
 
+ADAPTIVE_PATIENCE = True
+
 # maximum patience since last minimum val loss value
-MAX_PATIENCE = 20
+MAX_PATIENCE = 15
 
 # maximum batchsize allowed by the GPU in use
 MAX_BATCH_SIZE = 2000
@@ -45,16 +47,21 @@ MAX_BATCH_SIZE = 2000
 CUSTOM_LOGIC = True
 
 # disable Learning rate Annealing
-LRA_DIS = True
+LRA_DIS = False
 
 # disable Incremental Batch size
-IBS_DIS = False
+IBS_DIS = True
 
 # using learning rate annealing if True, incremental batch size if False in the current iteration
-USING_LRA = False
+USING_LRA = True
+
+# If altern is set to true, both logics are active and alterned
+ALTERN = False
+
+FINISH_EPOCHS = False
 
 # maximum iteration of custom logic
-MAX_CUSTOM_ITER = 6
+MAX_CUSTOM_ITER = 3
 
 #maximum loss value 
 MAX_LOSS = 9999999
@@ -65,4 +72,9 @@ LRA_DECAY = 0.2
 # incremental batch size increment
 IBS_INCREMENT = 2
 
+# scheduling of learning rate activate at milestones
+FIXED_SCHEDULING_LR = False
+
+# scheduling of batch size activate at milestones
+FIXED_SCHEDULING_BS = False
 

@@ -26,6 +26,8 @@ from conf import settings
 from utils import get_network, get_training_dataloader, get_test_dataloader, WarmUpLR, \
     most_recent_folder, most_recent_weights, last_epoch, best_acc_weights
 
+from DynamicConfig import DynamicConfig
+
 def train(epoch):
 
     start = time.time()
@@ -112,13 +114,17 @@ def eval_training(data_loader, split="Test", epoch=0, tb=True):
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('-net', type=str, required=True, help='net type')
-    parser.add_argument('-gpu', action='store_true', default=False, help='use gpu or not')
+    parser.add_argument('-config', type=str, required=True, help='net type')
+    parser.add_argument('-net', type=str, required=False, help='net type')
+    parser.add_argument('-gpu', action='store_true', default=True, help='use gpu or not')
     parser.add_argument('-b', type=int, default=128, help='batch size for dataloader')
     parser.add_argument('-warm', type=int, default=1, help='warm up training phase')
     parser.add_argument('-lr', type=float, default=0.1, help='initial learning rate')
     parser.add_argument('-resume', action='store_true', default=False, help='resume training')
     args = parser.parse_args()
+
+    config = DynamicConfig("conf/exp_configs/" + args.config + ".yml")
+    args.net = config.network
 
     net = get_network(args)
 
@@ -144,19 +150,20 @@ if __name__ == '__main__':
 
     loss_function = nn.CrossEntropyLoss()
     optimizer = optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
-    # train_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=settings.MILESTONES, gamma=0.2) #learning rate decay
+    if config.fixed_scheduling_lr:
+        train_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=settings.MILESTONES, gamma=0.2) #learning rate decay
     iter_per_epoch = len(cifar100_training_loader)
     warmup_scheduler = WarmUpLR(optimizer, iter_per_epoch * args.warm)
 
     if args.resume:
-        recent_folder = most_recent_folder(os.path.join(settings.CHECKPOINT_PATH, args.net), fmt=settings.DATE_FORMAT)
+        recent_folder = most_recent_folder(os.path.join(settings.CHECKPOINT_PATH, args.net), fmt=args.config)
         if not recent_folder:
             raise Exception('no recent folder were found')
 
         checkpoint_path = os.path.join(settings.CHECKPOINT_PATH, args.net, recent_folder)
 
     else:
-        checkpoint_path = os.path.join(settings.CHECKPOINT_PATH, args.net, settings.TIME_NOW)
+        checkpoint_path = os.path.join(settings.CHECKPOINT_PATH, args.net, args.config)
 
     #use tensorboard
     if not os.path.exists(settings.LOG_DIR):
@@ -165,7 +172,7 @@ if __name__ == '__main__':
     #since tensorboard can't overwrite old values
     #so the only way is to create a new tensorboard log
     writer = SummaryWriter(log_dir=os.path.join(
-            settings.LOG_DIR, args.net, settings.TIME_NOW))
+            settings.LOG_DIR, args.net, args.config))
     input_tensor = torch.Tensor(1, 3, 32, 32)
     if args.gpu:
         input_tensor = input_tensor.cuda()
@@ -197,15 +204,21 @@ if __name__ == '__main__':
         resume_epoch = last_epoch(os.path.join(settings.CHECKPOINT_PATH, args.net, recent_folder))
 
 
-    patience = settings.MAX_PATIENCE
+    patience = config.max_patience
+    cur_max_patience = config.max_patience
     min_val_loss = settings.MAX_LOSS
-    cur_custom_iter = settings.MAX_CUSTOM_ITER
+    cur_custom_iter = config.max_custom_iter
+    max_test_acc = 0
 
     bs = args.b
 
     for epoch in range(1, settings.EPOCH + 1):
-        # if epoch > args.warm:
-        #     train_scheduler.step(epoch)
+        if epoch > args.warm :
+            if config.fixed_scheduling_lr:
+                train_scheduler.step(epoch)
+            if config.fixed_scheduling_bs and epoch in config.milestones:
+                bs = min(bs*config.ibs_increment, config.max_batch_size) 
+                cifar100_training_loader = DataLoader(train_ds, shuffle=True, num_workers=4, batch_size=bs)
 
         if args.resume:
             if epoch <= resume_epoch:
@@ -215,6 +228,10 @@ if __name__ == '__main__':
 
         # test and validation
         acc, _ = eval_training(cifar100_test_loader, 'Test', epoch)
+        if acc > max_test_acc:
+            max_test_acc = acc
+        writer.add_scalar('Test' + '/MaxAccuracy', max_test_acc, epoch)
+
         val_acc, val_loss = eval_training(cifar100_validation_loader, 'Val', epoch)
 
         # logic to move learning rate or batch size, based on the validation split
@@ -222,36 +239,53 @@ if __name__ == '__main__':
             patience -= 1
         else:
             min_val_loss = val_loss
-            patience = settings.MAX_PATIENCE
+            patience = cur_max_patience
+        
+        writer.add_scalar('Val' + '/Patience', patience, epoch)
 
-        if settings.CUSTOM_LOGIC: 
-            if patience == 0:
-                if not settings.LRA_DIS and settings.USING_LRA: # if learning rate annealing is in use
-                    optimizer.param_groups[0]['lr']  = optimizer.param_groups[0]['lr']*settings.LRA_DECAY
-                    if not settings.IBS_DIS:
-                        settings.USING_LRA = False
-                elif not settings.IBS_DIS:
-                    if bs == settings.MAX_BATCH_SIZE: # if maximum batch size reached, stop
-                        cur_custom_iter = 0
-                    else:  # increment the batch size
-                        bs = min(bs*settings.IBS_INCREMENT, settings.MAX_BATCH_SIZE) 
-                        cifar100_training_loader = DataLoader(train_ds, shuffle=True, num_workers=4, batch_size=bs)
-                        cifar100_validation_loader = DataLoader(val_ds, shuffle=True, num_workers=4, batch_size=bs)
-                        if not settings.LRA_DIS:
-                            settings.USING_LRA = True
+
+        if config.custom_logic: 
+            if patience == 0 and cur_custom_iter > 0:
+                updateLR = False
+                updateBS = False
+
+                if config.altern:
+                    if config.using_lra:
+                        updateLR = True
+                        config.using_lra = False
+                    else:
+                        updateBS = True
+                        config.using_lra = True
+                else:
+                    if not config.lra_dis:
+                        updateLR = True
+                    if not config.ibs_dis:
+                        updateBS = True
+
+                print("-----------------Update LR: {}, Update BS: {}-----------------", updateLR, updateBS)
+
+                if updateLR:
+                    optimizer.param_groups[0]['lr']  = optimizer.param_groups[0]['lr']*config.lra_decay
+                if updateBS:
+                    bs = min(bs*config.ibs_increment, config.max_batch_size) 
+                    cifar100_training_loader = DataLoader(train_ds, shuffle=True, num_workers=4, batch_size=bs)
                 
-                patience = settings.MAX_PATIENCE
+
                 cur_custom_iter -=1
 
-
-        writer.add_scalar('Val' + '/Patience', patience, epoch)
+                if config.adaptive_patience:
+                    patience = max(round(config.max_patience * 1. / (config.patience_decay ** (config.max_custom_iter - cur_custom_iter))), 2)
+                    cur_max_patience = patience
+                else:
+                    patience = config.max_patience
+                
+        
         writer.add_scalar('Train' + '/BS', bs, epoch)
         writer.add_scalar('Train' + '/lr', optimizer.param_groups[0]['lr'], epoch)
 
-        if settings.CUSTOM_LOGIC: 
-            if cur_custom_iter == 0:
-                torch.save(net.state_dict(), weights_path)
-                break
+        if config.custom_logic and cur_custom_iter == 0 and not config.finish_epochs:
+            torch.save(net.state_dict(), weights_path)
+            break
 
 
         #start to save best performance model after learning rate decay to 0.01
